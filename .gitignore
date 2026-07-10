@@ -175,3 +175,17 @@ logs/
 output/
 evaluation_results/
 evaluation_results/*
+
+# --- 大文件/产物 (2026-07 上传 JJho1314 前加固) ---
+*.safetensors
+*.pth
+*.bin
+*.mp4
+*.parquet
+outputs/
+eval_results/
+eval_ckpts/
+eval_scripts/
+datasets/
+weights/
+LIBERO-plus/

@@ -18,6 +18,7 @@ from torch.utils.data.dataset import Dataset
 from einops import rearrange
 import glob
 from moviepy.editor import VideoFileClip
+import av
 import torchvision.transforms as transforms
 from tqdm import tqdm
 import torch.nn.functional as F
@@ -61,6 +62,7 @@ class CustomLeRobotDataset(Dataset):
         action_type = "absolute",
         action_space = "joint",
         ignore_seek = False,
+        pack_action_state = False,
         train_dataset=True,
         action_key = "action",
         state_key = "observation.state",
@@ -257,6 +259,9 @@ class CustomLeRobotDataset(Dataset):
                 self.StatisticInfo = json.load(f)
 
         self.ignore_seek = ignore_seek
+        ### pack per-timestep state into action tokens ([act; state] channels) and
+        ### pad the history state token to the same width, following data/libero_dataset.py
+        self.pack_action_state = pack_action_state
 
     def get_frame_indexes(self, total_frames, ):
         """
@@ -269,9 +274,11 @@ class CustomLeRobotDataset(Dataset):
         if self.fix_sidx is not None and self.fix_mem_idx is not None:
             action_indexes = list(range(self.fix_sidx, self.fix_sidx+self.action_chunk))
             frame_indexes = action_indexes[::self.video_temporal_stride]
-            action_indexes = np.clip(action_indexes, a_min=0, a_max=total_frames-1)
-            frame_indexes = np.clip(frame_indexes, a_min=0, a_max=total_frames-1)
-            return self.fix_mem_idx + frame_indexes, self.fix_mem_idx + action_indexes
+            action_indexes = np.clip(action_indexes, a_min=0, a_max=total_frames-1).tolist()
+            frame_indexes = np.clip(frame_indexes, a_min=0, a_max=total_frames-1).tolist()
+            ### concatenate (list + list), NOT numpy element-wise add; matches data/libero_dataset.py
+            fix_mem_idx = np.clip(self.fix_mem_idx, a_min=0, a_max=total_frames-1).tolist()
+            return fix_mem_idx + frame_indexes, fix_mem_idx + action_indexes
 
         chunk_end = random.randint(self.action_chunk, total_frames+self.action_chunk)
 
@@ -314,16 +321,28 @@ class CustomLeRobotDataset(Dataset):
         seek video frames according to the input slices;
         output video shape: (c,v,t,h,w)
         """
+        ### PyAV sequential decode: no per-sample ffmpeg subprocess, no per-frame seek
         video_list = []
+        want = sorted(set(int(s) for s in slices))
         for cam_name in cam_name_list:
-            video_reader = VideoFileClip(video_path.format(cam_name))
-            fps = video_reader.fps
-            video = []
-            for idx in slices:
-                video.append(video_reader.get_frame(float(idx)/fps))
-            video = torch.from_numpy(np.stack(video)).permute(3, 0, 1, 2).contiguous()
+            container = av.open(video_path.format(cam_name))
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            got = {}
+            last = None
+            for fidx, frame in enumerate(container.decode(stream)):
+                if fidx in want:
+                    got[fidx] = frame.to_ndarray(format="rgb24")
+                    last = got[fidx]
+                elif last is None:
+                    last = frame.to_ndarray(format="rgb24")
+                if fidx >= want[-1]:
+                    break
+            container.close()
+            ### clamp out-of-range indexes to the last decoded frame
+            video = np.stack([got.get(int(s), last) for s in slices])
+            video = torch.from_numpy(video).permute(3, 0, 1, 2).contiguous()
             video = video.float()/255.
-            video_reader.close()
             video_list.append(video)
         return video_list
 
@@ -433,8 +452,9 @@ class CustomLeRobotDataset(Dataset):
         
         action = action.astype(np.float32)
         state = state.astype(np.float32)
-        state = torch.FloatTensor(state)[indexes][self.n_previous-1:self.n_previous]
-        
+        state_seq = torch.FloatTensor(state)[indexes]
+        state = state_seq[self.n_previous-1:self.n_previous]
+
         state = (state - state_mean) / state_std
 
         if self.action_type == "absolute":
@@ -473,6 +493,13 @@ class CustomLeRobotDataset(Dataset):
 
             raise NotImplementedError
 
+
+        if self.pack_action_state:
+            ### action token: [act(C_a); state_t(C_s)], history token: [zeros(C_a); state(C_s)]
+            state_seq_norm = (state_seq - state_mean) / state_std
+            ori_act_dim = action.shape[1]
+            action = torch.cat((action, state_seq_norm), dim=1)
+            state = torch.cat((torch.zeros([1, ori_act_dim]), state), dim=1)
 
         videos = self.seek_mp4(video_path, self.valid_cam, vid_indexes)
 

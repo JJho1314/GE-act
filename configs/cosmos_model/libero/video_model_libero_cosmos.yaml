@@ -1,0 +1,179 @@
+model_name: 'cosmos2_train'
+is_i2v: True
+report_to: None
+tracker_name: cosmos2_trainer
+
+logging_dir: logs
+output_dir: /data/user/jhe724/junjie/outputs/libero_cosmos_videoadapt
+# holds text_encoder/ + tokenizer/ + vae/ subfolders (diffusers format)
+pretrained_model_name_or_path: /data/user/jhe724/junjie/weights/Cosmos-Predict2-2B-Video2World
+
+###
+train_data_class_path: data/lerobot_like_dataset.py
+train_data_class: CustomLeRobotDataset
+val_data_class_path: data/lerobot_like_dataset.py
+val_data_class: CustomLeRobotDataset
+
+### Cosmos component stack (T5 1024-dim + Wan VAE + MultiViewCosmos + GeSimCosmos2 pipeline)
+tokenizer_class_path: transformers
+tokenizer_class: T5TokenizerFast
+textenc_class_path: transformers
+textenc_class: T5EncoderModel
+vae_class_path: models/cosmos_models/models/autoencoders/autoencoder_kl_wan.py
+vae_class: AutoencoderKLWan
+diffusion_model_class_path: models/cosmos_models/models/transformers/transformer_cosmos_multiview.py
+diffusion_model_class: MultiViewCosmosTransformer3DModel
+diffusion_scheduler_class_path: models/pipeline/gesim_cosmos2_pipeline_utils/scheduling_flow_match_euler_discrete.py
+diffusion_scheduler_class: FlowMatchEulerDiscreteScheduler
+pipeline_class_path: models/pipeline/gesim_pipeline.py
+pipeline_class: GeSimCosmos2Pipeline
+
+#
+return_action: false
+return_video: true
+train_mode: 'video_only'
+action_loss_scale: 1.0
+
+# total training step is decided by the minimum of the below two
+train_steps: 1000000
+train_epochs: 10000
+steps_to_save: 10000
+steps_to_log: 20
+# Cosmos validate() is broken (pipeline arg order + mandatory raymap cond_to_concat) -> disable
+steps_to_val: 2000000000
+
+mixed_precision: bf16
+allow_tf32: False
+
+# timeout, seconds
+nccl_timeout: 600
+seed: 42
+
+# vae
+enable_slicing: True
+enable_tiling: True
+
+add_state: False
+
+caption_dropout_p: 0.06
+
+# dataloader
+batch_size: 8
+dataloader_num_workers: 8
+pin_memory: True
+
+gradient_checkpointing: True
+noise_to_first_frame: 0.1
+
+# Optimizer Config
+optimizer: adamw
+lr: 3e-4
+beta1: 0.9
+beta2: 0.95
+beta3: 0.999
+epsilon: 1e-8
+weight_decay: 1e-5
+optimizer_8bit: False
+optimizer_torchao: False
+scale_lr: False
+
+max_grad_norm: 1.0
+# grad accum 2 -> global batch = 8/卡 × 8卡 × 2 = 128 (对齐 LTX 版)
+gradient_accumulation_steps: 2
+
+# lr_scheduler Config
+lr_scheduler: constant_with_warmup
+lr_warmup_steps: 1000
+lr_num_cycles: 1
+lr_power: 1.0
+
+# Timestep Config
+flow_weighting_scheme: none
+flow_logit_mean: 0.0
+flow_logit_std: 1.0
+flow_mode_scale: 1.29
+
+# Cosmos reshapes timestep per-frame (transformer_cosmos_multiview.py:423), needs per-frame not per-token
+pixel_wise_timestep: False
+
+diffusion_model:
+  # 续训: 从 step_20000 (global batch 64 阶段) 热启动, 改 grad accum 2 继续 (global 128).
+  # 该 ckpt 已含训练好的 17 通道 patch_embed, 全键匹配无失配. (原始 base: ge_sim_cosmos_v0.1.safetensors)
+  model_path: /data/user/jhe724/junjie/outputs/libero_cosmos_videoadapt/2026_07_09_15_45_09/step_20000/diffusion_pytorch_model.safetensors
+  config:
+    in_channels: 17   # 16 (Wan VAE latent) + 1 (condition_mask); +1 padding auto -> 18 into patch_embed
+    out_channels: 16
+    num_attention_heads: 16    # hidden = 16*128 = 2048
+    attention_head_dim: 128
+    num_layers: 28
+    mlp_ratio: 4.0
+    text_embed_dim: 1024
+    adaln_lora_dim: 256
+    max_size: [128, 240, 240]
+    patch_size: [1, 2, 2]
+    rope_scale: [1.0, 3.0, 3.0]
+    concat_padding_mask: true
+    extra_pos_embed_type: null
+    use_view_embed: true
+    max_view: 3    # keep 3 (>= LIBERO 2 views) so view_embed loads without mismatch
+    action_expert: false
+    action_in_channels: 7
+    action_num_attention_heads: 16
+    action_attention_head_dim: 32
+    action_rope_dim: 32
+
+data:
+  train:
+    data_roots: ["/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam"]
+    domains: ["libero_10_no_noops_lerobot", "libero_goal_no_noops_lerobot", "libero_object_no_noops_lerobot", "libero_spatial_no_noops_lerobot"]
+    sample_size: [256, 256]
+    sample_n_frames: 500
+    preprocess :  'resize'
+    valid_cam :  ['observation.images.image', 'observation.images.wrist_image']
+    chunk: 9   # Wan VAE is 4x temporal -> chunk must be 4n+1 (9 = 4*2+1)
+    action_chunk: 36
+    n_previous: 4
+    previous_pick_mode: 'random'
+    random_crop: False
+    ignore_seek: False
+    action_type: "absolute"
+    action_space: "eef"
+    stat_file: configs/ltx_model/libero/libero_fastwam_mix.json
+    state_key: observation.state
+    action_key: action
+  val:
+    data_roots: ["/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam", "/data/user/jhe724/junjie/datasets/LIBERO-fastwam"]
+    domains: ["libero_10_no_noops_lerobot", "libero_goal_no_noops_lerobot", "libero_object_no_noops_lerobot", "libero_spatial_no_noops_lerobot"]
+    sample_size: [256, 256]
+    sample_n_frames: 500
+    preprocess :  'resize'
+    valid_cam : ['observation.images.image', 'observation.images.wrist_image']
+    chunk: 9
+    action_chunk: 36
+    n_previous: 4
+    previous_pick_mode: 'random'
+    random_crop: False
+    ignore_seek: False
+    action_type: "absolute"
+    action_space: "eef"
+    stat_file: configs/ltx_model/libero/libero_fastwam_mix.json
+    state_key: observation.state
+    action_key: action
+
+use_color_jitter: true
+num_inference_step: 15
+noisy_video: false
+
+# false for quick debug, for training set True
+load_weights: true
+
+# deepspeed config
+use_deepspeed: true
+deepspeed:
+  zero_optimization:
+    stage: 2
+  fp16:
+    enabled: false
+  bf16:
+    enabled: true
+  gradient_clipping: 1.0

@@ -99,14 +99,20 @@ class InferenceLibero:
         with open(cd['data']['val']['stat_file'], "r") as f:
             self.StatisticInfo = json.load(f)
 
-        self.act_mean = torch.tensor(self.StatisticInfo["libero_eef"]["mean"]).unsqueeze(0)
-        self.act_std = torch.tensor(self.StatisticInfo["libero_eef"]["std"]).unsqueeze(0)
-        self.states_mean = torch.tensor(self.StatisticInfo["libero_state_eef"]['mean']).unsqueeze(0)
-        self.states_std = torch.tensor(self.StatisticInfo["libero_state_eef"]['std']).unsqueeze(0)
-        self.act_min = torch.tensor(self.StatisticInfo["libero_eef"]["q01"]).unsqueeze(0)
-        self.act_max = torch.tensor(self.StatisticInfo["libero_eef"]["q99"]).unsqueeze(0)
-        self.states_min = torch.tensor(self.StatisticInfo["libero_state_eef"]['q01']).unsqueeze(0)
-        self.states_max = torch.tensor(self.StatisticInfo["libero_state_eef"]['q99']).unsqueeze(0)
+        ### pick the stat keys for this task suite. supports both the official single-domain
+        ### file (keys "libero_eef"/"libero_state_eef") and the fastwam mixed file
+        ### (keys "libero_<suite>_no_noops_lerobot_eef"). falls back to "libero".
+        _dom = task_suite_name + "_no_noops_lerobot"
+        if _dom + "_eef" not in self.StatisticInfo:
+            _dom = "libero" if "libero_eef" in self.StatisticInfo else _dom
+        self.act_mean = torch.tensor(self.StatisticInfo[_dom+"_eef"]["mean"]).unsqueeze(0)
+        self.act_std = torch.tensor(self.StatisticInfo[_dom+"_eef"]["std"]).unsqueeze(0)
+        self.states_mean = torch.tensor(self.StatisticInfo[_dom+"_state_eef"]['mean']).unsqueeze(0)
+        self.states_std = torch.tensor(self.StatisticInfo[_dom+"_state_eef"]['std']).unsqueeze(0)
+        self.act_min = torch.tensor(self.StatisticInfo[_dom+"_eef"]["q01"]).unsqueeze(0)
+        self.act_max = torch.tensor(self.StatisticInfo[_dom+"_eef"]["q99"]).unsqueeze(0)
+        self.states_min = torch.tensor(self.StatisticInfo[_dom+"_state_eef"]['q01']).unsqueeze(0)
+        self.states_max = torch.tensor(self.StatisticInfo[_dom+"_state_eef"]['q99']).unsqueeze(0)
     
 
         self.action_chunk = cd["data"]["val"]["action_chunk"]
@@ -312,12 +318,16 @@ class InferenceLibero:
         )[0]
 
         actions_pred = pred_all["action"].detach().cpu()[0]
-        # actions_pred = actions_pred * self.act_std + self.act_mean
-
 
         actions_pred = actions_pred[:, :self.basic_action_dim]
-        actions_pred = (actions_pred + 1)/2
-        actions_pred = actions_pred * (self.act_max-self.act_min+1e-6) + self.act_min
+        ### mean/std de-normalization to match lerobot_like_dataset (fastwam) training.
+        ### the official minmax path is kept below for reference.
+        actions_pred = actions_pred.float() * self.act_std[:, :self.basic_action_dim] + self.act_mean[:, :self.basic_action_dim]
+        # actions_pred = (actions_pred + 1)/2
+        # actions_pred = actions_pred * (self.act_max-self.act_min+1e-6) + self.act_min
+        ### gripper: fastwam data-space [0,1] (0=close,1=open) -> LIBERO env [-1,1] (-1=open,+1=close)
+        ### equals official (g*2-1) then invert_gripper_action (*-1): g_env = 1 - 2*g
+        actions_pred[:, -1] = 1.0 - 2.0 * actions_pred[:, -1]
 
         self.action_buffer = actions_pred.clone()
 
@@ -392,8 +402,8 @@ class InferenceLibero:
                     if self.with_state:
                         state = get_libero_state(obs)
 
-                        state = (torch.tensor(state) - self.states_min) / (self.states_max - self.states_min + 1e-6)
-                        state = state * 2 -1
+                        ### mean/std normalization to match lerobot_like_dataset (fastwam) training
+                        state = (torch.tensor(state).float() - self.states_mean) / (self.states_std + 1e-6)
                         state = torch.cat((torch.zeros([1,self.basic_action_dim]), state), dim=1)
 
                         actions = self.play(img_obs, task_description, excution_step=self.excution_step, state=state) # action_chunk * action_dim
