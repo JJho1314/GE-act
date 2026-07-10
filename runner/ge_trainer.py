@@ -728,14 +728,15 @@ class Trainer:
                             if self.args.train_mode == 'all' or self.args.train_mode == 'video_only':
                                 self.writer.add_scalar("Video loss", loss_video.item(), global_step)
 
-                if global_step % self.args.steps_to_val == 0:
+                # global_step > 0 守卫: step 0 时 0 % N == 0 恒真会误触发 (grad_accum>1 时首步 global_step 停在 0)
+                if global_step > 0 and global_step % self.args.steps_to_val == 0:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         model_save_dir = os.path.join(self.save_folder,f'Validation_step_{global_step}')
                         self.validate(accelerator, model_save_dir, global_step, n_view=n_view, n_chunk=1)
 
                 
-                if global_step % self.args.steps_to_save == 0:
+                if global_step > 0 and global_step % self.args.steps_to_save == 0:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         model_to_save = unwrap_model(accelerator, self.diffusion_model)
